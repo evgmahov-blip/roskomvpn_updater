@@ -10,6 +10,8 @@ import subprocess
 import sys
 import urllib.request
 
+DRY_RUN = "--dry-run" in sys.argv[1:]
+
 API_DOMAIN = os.environ.get("REMNA_API_DOMAIN", "").strip()
 SOURCE_UUID = os.environ.get("REMNA_SOURCE_UUID", "").strip()
 TARGET_UUID = os.environ.get("REMNA_TARGET_UUID", "").strip()
@@ -17,7 +19,6 @@ TOKEN = os.environ.get("REMNA_TOKEN", "").strip()
 
 BASE = pathlib.Path("/opt/remna-xray-auto-updater")
 BACKUPS = BASE / "backups"
-AUTO_MARKER = "ROSCOMVPN-AUTO-DIRECT"
 
 SOURCES = [
     "https://raw.githubusercontent.com/hydraponique/roscomvpn-geosite/master/data/whitelist",
@@ -65,10 +66,7 @@ def curl_json(method, path, body=None):
     ]
 
     if body is not None:
-        cmd += [
-            "-H", "Content-Type: application/json",
-            "--data-binary", "@-",
-        ]
+        cmd += ["-H", "Content-Type: application/json", "--data-binary", "@-"]
 
     cmd.append(API_BASE + path)
 
@@ -86,10 +84,7 @@ def curl_json(method, path, body=None):
 
 
 def download(url):
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "remna-xray-auto-updater/1.2"},
-    )
+    req = urllib.request.Request(url, headers={"User-Agent": "roskomvpn-updater/1.3"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read().decode("utf-8")
 
@@ -99,7 +94,6 @@ def parse_domains(text):
 
     for raw in text.splitlines():
         line = raw.strip()
-
         if not line or line.startswith("#"):
             continue
 
@@ -112,9 +106,7 @@ def parse_domains(text):
 
         domain = domain.lower().rstrip(".")
 
-        if not domain:
-            continue
-        if domain.endswith(".ru"):
+        if not domain or domain.endswith(".ru"):
             continue
         if domain in DENY_EXACT:
             continue
@@ -132,8 +124,6 @@ def extract_manual_domains(rules):
     for rule in rules:
         if not isinstance(rule, dict):
             continue
-        if rule.get("_remnaAuto") == AUTO_MARKER:
-            continue
 
         for entry in rule.get("domain", []) or []:
             if not isinstance(entry, str):
@@ -149,13 +139,14 @@ def extract_manual_domains(rules):
 
 
 def is_catch_all(rule):
-    if not isinstance(rule, dict):
-        return False
-    if rule.get("type") != "field":
+    if not isinstance(rule, dict) or rule.get("type") != "field":
         return False
     network = str(rule.get("network", "")).replace(" ", "").lower()
     return network == "tcp,udp"
 
+
+if DRY_RUN:
+    print("[DRY-RUN] Режим проверки: PATCH и backup выполняться не будут.")
 
 print("[1] Читаю исходный XRAY_JSON шаблон...")
 source_response = curl_json("GET", f"/subscription-templates/{SOURCE_UUID}")
@@ -183,47 +174,50 @@ domains -= manual_domains
 conflicts_removed = before_conflict_filter - len(domains)
 domains = sorted(domains)
 
-print(f"[OK] Исключено конфликтов с ручными правилами: {conflicts_removed}")
-print(f"[OK] Auto-direct доменов после всех фильтров: {len(domains)}")
+print(f"[OK] Исключено совпадений с ручными domain/full: {conflicts_removed}")
+print(f"[OK] Auto-direct доменов: {len(domains)}")
 
 if len(domains) < 50:
-    raise SystemExit(f"[ОШИБКА] Подозрительно мало доменов: {len(domains)}. PATCH запрещён")
+    raise SystemExit(f"[ОШИБКА] Подозрительно мало доменов: {len(domains)}. Обновление запрещено")
 if len(domains) > 1000:
-    raise SystemExit(f"[ОШИБКА] Подозрительно много доменов: {len(domains)}. PATCH запрещён")
+    raise SystemExit(f"[ОШИБКА] Подозрительно много доменов: {len(domains)}. Обновление запрещено")
 
 new_cfg = copy.deepcopy(cfg)
 rules = new_cfg.setdefault("routing", {}).setdefault("rules", [])
-clean_rules = []
-
-for rule in rules:
-    if isinstance(rule, dict) and rule.get("_remnaAuto") == AUTO_MARKER:
-        continue
-    clean_rules.append(rule)
 
 auto_rule = {
-    "_remnaAuto": AUTO_MARKER,
     "type": "field",
     "domain": [f"domain:{x}" for x in domains],
     "outboundTag": "direct",
 }
 
-insert_at = len(clean_rules)
-for i, rule in enumerate(clean_rules):
+insert_at = len(rules)
+for i, rule in enumerate(rules):
     if is_catch_all(rule):
         insert_at = i
         break
 
-clean_rules.insert(insert_at, auto_rule)
-new_cfg["routing"]["rules"] = clean_rules
+rules.insert(insert_at, auto_rule)
 
-generated = BASE / "generated.json"
-generated.write_text(json.dumps(new_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-
+preview = BASE / "generated.json"
+preview.write_text(json.dumps(new_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 print(f"[OK] Auto-rule позиция: {insert_at + 1}")
-print(f"[OK] Routing rules всего: {len(clean_rules)}")
+print(f"[OK] Routing rules всего: {len(rules)}")
+print(f"[OK] Preview: {preview}")
 
 target_response = curl_json("GET", f"/subscription-templates/{TARGET_UUID}")
 target = target_response.get("response", target_response)
+old_cfg = target.get("templateJson")
+
+if old_cfg == new_cfg:
+    print("[OK] Изменений нет. PATCH не требуется.")
+    sys.exit(0)
+
+if DRY_RUN:
+    print("[DRY-RUN] Изменения есть, но целевой шаблон НЕ изменен.")
+    print(f"[AUTO DOMAINS] {len(domains)}")
+    print(f"[MANUAL MATCHES REMOVED] {conflicts_removed}")
+    sys.exit(0)
 
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 backup = BACKUPS / f"target-{TARGET_UUID}-{timestamp}.json"
@@ -231,23 +225,15 @@ backup.write_text(json.dumps(target, ensure_ascii=False, indent=2), encoding="ut
 os.chmod(backup, 0o600)
 print(f"[OK] Backup TARGET: {backup}")
 
-old_cfg = target.get("templateJson")
-if old_cfg == new_cfg:
-    print("[OK] Изменений нет. PATCH не требуется.")
-    sys.exit(0)
+body = {"uuid": TARGET_UUID, "templateJson": new_cfg}
 
-body = {
-    "uuid": TARGET_UUID,
-    "templateJson": new_cfg,
-}
-
-print("[3] PATCH только целевого XRAY_JSON шаблона...")
+print("[3] PATCH целевого XRAY_JSON шаблона...")
 updated_response = curl_json("PATCH", "/subscription-templates", body)
 updated = updated_response.get("response", updated_response)
 
 if updated.get("uuid") != TARGET_UUID:
     raise SystemExit("[ОШИБКА] API вернул неожиданный UUID")
 
-print("[OK] Целевой XRAY_JSON обновлён.")
+print("[OK] Целевой XRAY_JSON обновлен.")
 print(f"[AUTO DOMAINS] {len(domains)}")
-print(f"[MANUAL CONFLICTS REMOVED] {conflicts_removed}")
+print(f"[MANUAL MATCHES REMOVED] {conflicts_removed}")
