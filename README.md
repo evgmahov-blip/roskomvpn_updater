@@ -1,39 +1,45 @@
 # roskomvpn_updater
 
-Безопасный updater для Remnawave XRAY_JSON шаблонов.
+Простой автообновлятор маршрутизации для Remnawave XRAY_JSON.
 
-## Что делает
+Он берет списки RoskomVPN, добавляет нужные домены в `direct` и не ломает уже существующие ручные правила: ручные правила всегда остаются выше автоматического списка.
 
-- берет существующий XRAY_JSON шаблон Remnawave как базовый;
-- скачивает `whitelist` и `category-ru` из `hydraponique/roscomvpn-geosite`;
-- преобразует записи в обычные `domain:...`, без зависимости от кастомного `geosite.dat`;
-- исключает `.ru`, проверочные IP-сервисы и denylist;
-- не переопределяет существующие ручные `domain:` / `full:` правила;
-- добавляет auto-direct правило после ручных правил;
-- сохраняет backup целевого шаблона перед PATCH;
-- обновляет только UUID из `REMNA_TARGET_UUID`;
-- отказывается применять подозрительно маленький или большой список.
+## Что умеет
+
+- обновляет списки `whitelist` и `category-ru`;
+- использует обычные `domain:...`, без отдельного `geosite.dat`;
+- не трогает `.ru`, если они уже обрабатываются текущими правилами;
+- исключает IP-check сервисы и denylist;
+- сохраняет backup перед изменением шаблона;
+- работает по UUID шаблона, поэтому его можно переименовывать;
+- есть `--dry-run` для проверки без PATCH;
+- есть systemd timer для автоматического обновления;
+- есть безопасный `uninstall.sh`.
 
 Рекомендуемое имя целевого шаблона: `RU_adguard_auto`.
-
-Имя шаблона не используется updater-ом для записи: привязка идет по UUID, поэтому шаблон можно безопасно переименовывать без изменения конфигурации updater-а.
 
 ## Установка
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/evgmahov-blip/roskomvpn_updater/main/install.sh -o install.sh
 sudo bash install.sh
 ```
 
-Установщик спросит:
+Установщик спросит домен Remnawave, UUID исходного и целевого XRAY_JSON шаблонов, API token, время запуска и timezone.
 
-- домен панели Remnawave;
-- UUID исходного XRAY_JSON шаблона;
-- UUID целевого XRAY_JSON шаблона;
-- API token;
-- время ежедневного запуска;
-- timezone systemd timer.
+API token хранится только локально в `/etc/remna-xray-auto-updater.env` с правами `600`.
 
-API token сохраняется только локально в `/etc/remna-xray-auto-updater.env` с правами `600` и в GitHub не попадает.
+## Проверка без изменений
+
+```bash
+set -a
+. /etc/remna-xray-auto-updater.env
+set +a
+/opt/remna-xray-auto-updater/update.py --dry-run
+unset REMNA_TOKEN
+```
+
+`--dry-run` скачает списки, соберет итоговый JSON и покажет, есть ли изменения, но не сделает backup и не отправит PATCH в Remnawave.
 
 ## Ручной запуск
 
@@ -48,23 +54,26 @@ sudo journalctl -u remna-xray-auto-updater.service -n 100 --no-pager
 systemctl list-timers remna-xray-auto-updater.timer --no-pager
 ```
 
-## Приоритет правил
+## Удаление
 
-Updater каждый запуск заново берет исходный шаблон. Ручные правила сохраняются в исходном порядке. Автоматический direct-список добавляется после них, поэтому ручные исключения имеют приоритет.
-
-Схема:
-
-```text
-ручные block/direct/proxy правила
-        ↓
-roscomvpn auto-direct
-        ↓
-обычный fallback/proxy
+```bash
+curl -fsSL https://raw.githubusercontent.com/evgmahov-blip/roskomvpn_updater/main/uninstall.sh -o uninstall.sh
+sudo bash uninstall.sh
 ```
 
-Перед использованием на рабочем шаблоне рекомендуется сначала проверить отдельный целевой шаблон на одном клиенте: запуск ядра и фактический выбор `direct` / `proxy` в access log.
+Удаление отключает timer, удаляет updater и локальный API token. Backups оставляет на месте. Шаблоны Remnawave не удаляет и не откатывает.
 
-## Источники списков
+## Как идет трафик
+
+```text
+ручные правила
+      ↓
+auto-direct RoskomVPN
+      ↓
+обычный proxy / fallback
+```
+
+Источники списков:
 
 - https://github.com/hydraponique/roscomvpn-geosite
 - https://github.com/hydraponique/roscomvpn-routing
